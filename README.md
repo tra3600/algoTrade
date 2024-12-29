@@ -1,2 +1,2 @@
 # algoTrade
-algorithme de trading basé sur les moyennes mobiles
+algorithme de trading 
