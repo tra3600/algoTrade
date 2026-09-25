@@ -1,26 +1,55 @@
-def select_stock(api):
-    # Récupérer les données de marché pour les actions les plus actives
-    active_stocks = api.get_assets(status='active')
-    
-    # Filtrer les actions éligibles (par exemple, uniquement les actions du NASDAQ)
-    nasdaq_stocks = [stock.symbol for stock in active_stocks if stock.exchange == 'NASDAQ']
+"""Sélection de l'action à trader : la plus active en volume parmi les titres éligibles."""
+import logging
 
-    # Récupérer les données historiques des actions éligibles
-    end_date = pd.Timestamp.now(tz='America/New_York')
-    start_date = end_date - pd.Timedelta(days=1)
-    barset = api.get_barset(nasdaq_stocks, 'day', start=start_date, end=end_date)
+from alpaca.data.requests import MostActivesRequest, StockLatestTradeRequest
+from alpaca.data.enums import DataFeed
+from alpaca.trading.enums import AssetClass, AssetStatus
+from alpaca.trading.requests import GetAssetsRequest
 
-    # Choisir l'action avec le plus grand volume de trading
-    max_volume = 0
-    selected_stock = None
-    for symbol in nasdaq_stocks:
-        if symbol in barset and len(barset[symbol]) > 0:
-            volume = barset[symbol][0].v
-            if volume > max_volume:
-                max_volume = volume
-                selected_stock = symbol
+from config import Config
 
-    return selected_stock
+log = logging.getLogger(__name__)
 
-selected_stock = select_stock(api)
-print(f"Selected stock: {selected_stock}")
+
+def get_tradable_symbols(trading_client, exchanges) -> set[str]:
+    assets = trading_client.get_all_assets(
+        GetAssetsRequest(status=AssetStatus.ACTIVE, asset_class=AssetClass.US_EQUITY)
+    )
+    return {
+        a.symbol for a in assets
+        if a.tradable and str(getattr(a.exchange, "value", a.exchange)) in exchanges
+    }
+
+
+def select_stock(clients, cfg: Config) -> str | None:
+    """Renvoie le symbole le plus échangé (screener Alpaca), filtré par bourse et fourchette de prix."""
+    sel = cfg.selection
+    most_actives = clients.screener.get_most_actives(MostActivesRequest(top=sel.top_n, by="volume"))
+    candidates = [m.symbol for m in most_actives.most_actives]
+    if not candidates:
+        log.warning("Le screener n'a renvoyé aucun titre.")
+        return None
+
+    tradable = get_tradable_symbols(clients.trading, sel.exchanges)
+    candidates = [s for s in candidates if s in tradable]
+    if not candidates:
+        return None
+
+    latest = clients.data.get_stock_latest_trade(
+        StockLatestTradeRequest(symbol_or_symbols=candidates, feed=DataFeed(cfg.data_feed))
+    )
+    # candidates est déjà trié par volume décroissant
+    for symbol in candidates:
+        trade = latest.get(symbol)
+        if trade and sel.min_price <= trade.price <= sel.max_price:
+            log.info("Action sélectionnée : %s (prix %.2f)", symbol, trade.price)
+            return symbol
+    return None
+
+
+if __name__ == "__main__":
+    from alpaca_connect import get_clients
+
+    logging.basicConfig(level=logging.INFO)
+    config = Config.from_env()
+    print(f"Selected stock: {select_stock(get_clients(config), config)}")
