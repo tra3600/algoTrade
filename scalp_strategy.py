@@ -1,39 +1,80 @@
-def scalping_strategy(api, stock, quantity):
-    while True:
-        # Récupérer les données de marché en temps réel
-        barset = api.get_barset(stock, 'minute', limit=5)
-        bars = barset[stock]
+"""Stratégie de scalping par croisement de moyennes mobiles.
 
-        # Calculer les moyennes mobiles
-        close_prices = np.array([bar.c for bar in bars])
-        short_ma = np.mean(close_prices[-3:])
-        long_ma = np.mean(close_prices)
+La logique est une fonction pure (prix + position -> décision) : la même
+fonction sert au backtest et au bot en direct, ce qui garantit que l'on
+teste exactement ce que l'on exécute.
 
-        # Critères d'achat et de vente
-        if short_ma > long_ma:
-            # Acheter l'action
-            api.submit_order(
-                symbol=stock,
-                qty=quantity,
-                side='buy',
-                type='market',
-                time_in_force='gtc'
-            )
-            print(f"Bought {quantity} shares of {stock}")
-        elif short_ma < long_ma:
-            # Vendre l'action
-            api.submit_order(
-                symbol=stock,
-                qty=quantity,
-                side='sell',
-                type='market',
-                time_in_force='gtc'
-            )
-            print(f"Sold {quantity} shares of {stock}")
+Corrections par rapport à la version d'origine :
+- on n'agit qu'au *croisement* des moyennes, pas tant que court > long
+  (l'ancien code rachetait 10 actions chaque minute) ;
+- on ne vend que ce que l'on possède (pas de vente à découvert involontaire) ;
+- stop-loss et take-profit pour limiter les pertes.
+"""
 
-        # Attendre une minute avant la prochaine itération
-        time.sleep(60)
+from dataclasses import dataclass
 
-# Exécuter la stratégie de scalping
-quantity = 10  # Quantité d'actions à acheter/vendre
-scalping_strategy(api, selected_stock, quantity)
+import numpy as np
+
+ACHAT, VENTE = "achat", "vente"
+
+
+@dataclass
+class ParametresStrategie:
+    court: int = 5            # fenêtre de la moyenne mobile courte (en barres)
+    long: int = 20            # fenêtre de la moyenne mobile longue
+    stop_loss: float = 0.01   # sortie si le prix baisse de 1 % sous le prix d'entrée
+    take_profit: float = 0.02  # sortie si le prix monte de 2 % au-dessus
+
+    def __post_init__(self):
+        if not 1 <= self.court < self.long:
+            raise ValueError("Il faut 1 ≤ court < long.")
+        if self.stop_loss < 0 or self.take_profit < 0:
+            raise ValueError("stop_loss et take_profit doivent être positifs (0 = désactivé).")
+
+
+@dataclass
+class Decision:
+    action: str | None   # ACHAT, VENTE ou None (ne rien faire)
+    raison: str
+
+
+def moyennes_mobiles(prix, fenetre):
+    """Moyenne mobile simple ; NaN tant que la fenêtre n'est pas remplie."""
+    prix = np.asarray(prix, dtype=float)
+    res = np.full(len(prix), np.nan)
+    if len(prix) >= fenetre:
+        cumul = np.cumsum(np.insert(prix, 0, 0.0))
+        res[fenetre - 1:] = (cumul[fenetre:] - cumul[:-fenetre]) / fenetre
+    return res
+
+
+def croisement(prix, p: ParametresStrategie):
+    """ACHAT si la MM courte vient de passer au-dessus de la longue, VENTE si l'inverse."""
+    if len(prix) < p.long + 1:
+        return None
+    court = moyennes_mobiles(prix[-(p.long + 1):], p.court)
+    long = moyennes_mobiles(prix[-(p.long + 1):], p.long)
+    avant, maintenant = court[-2] - long[-2], court[-1] - long[-1]
+    if np.isnan(avant):
+        return None
+    if avant <= 0 < maintenant:
+        return ACHAT
+    if avant >= 0 > maintenant:
+        return VENTE
+    return None
+
+
+def decider(prix, en_position, prix_entree, p: ParametresStrategie):
+    """Décision à la clôture de la dernière barre de ``prix``."""
+    dernier = float(prix[-1])
+    if en_position:
+        if p.stop_loss and dernier <= prix_entree * (1 - p.stop_loss):
+            return Decision(VENTE, f"stop-loss ({dernier:.2f} ≤ {prix_entree * (1 - p.stop_loss):.2f})")
+        if p.take_profit and dernier >= prix_entree * (1 + p.take_profit):
+            return Decision(VENTE, f"take-profit ({dernier:.2f} ≥ {prix_entree * (1 + p.take_profit):.2f})")
+        if croisement(prix, p) == VENTE:
+            return Decision(VENTE, "la MM courte repasse sous la MM longue")
+        return Decision(None, "on garde la position")
+    if croisement(prix, p) == ACHAT:
+        return Decision(ACHAT, "la MM courte croise la MM longue par le haut")
+    return Decision(None, "pas de signal")
