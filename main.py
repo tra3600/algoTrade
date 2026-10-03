@@ -1,6 +1,10 @@
 """algoTrade — point d'entrée.
 
-    python main.py cas                          # cas illustrés sur 5 marchés simulés (sans clé API)
+    python main.py cas                          # cas d'origine sur 5 marchés simulés (sans clé API)
+    python main.py cas --liste                  # les 14 cas illustrés
+    python main.py cas --tout --sauver figures
+    python main.py comparer --scenario regimes  # toutes les stratégies sur un marché
+    python main.py montecarlo --scenario lateral --graines 100
     python main.py backtest --scenario krach --graphique
     python main.py backtest --csv mes_donnees.csv
     python main.py simulation --scenario haussier   # le bot en accéléré sur un marché simulé
@@ -16,14 +20,28 @@ import re
 import sys
 
 from scalp_strategy import ParametresStrategie
+from donnees import SCENARIOS_ETENDUS
+from strategies import CATALOGUE
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 
 def _params(args):
-    return ParametresStrategie(court=args.court, long=args.long,
-                               stop_loss=args.stop / 100, take_profit=args.objectif / 100)
+    """La stratégie choisie par --strategie (par défaut : croisement de moyennes mobiles)."""
+    stop, objectif = args.stop / 100, args.objectif / 100
+    nom = getattr(args, "strategie", "mm")
+    if nom == "mm":
+        return ParametresStrategie(court=args.court, long=args.long, stop_loss=stop, take_profit=objectif)
+    from strategies import CATALOGUE, creer
+    options = {"stop_loss": stop, "take_profit": objectif}
+    if nom == "tenir":
+        options = {}
+    elif nom == "mm_filtre":
+        options.update(court=args.court, long=args.long)
+    elif args.fenetre:
+        options["periode" if nom == "rsi" else "fenetre"] = args.fenetre
+    return creer(nom, **options)
 
 
 def _afficher_resultat(titre, res):
@@ -47,45 +65,18 @@ def _montrer(fig, sauver, nom):
 # ----------------------------------------------------------------------
 def cmd_cas(args):
     """Les cas illustrés : que vaut la stratégie selon le marché, les frais, les réglages ?"""
-    import matplotlib
+    import cas
+    if args.liste:
+        cas.liste()
+        return
+    ctx = cas.Contexte(base=_params(args), graine=args.graine, frais=args.frais,
+                       graines=args.graines, graphique=args.graphique, sauver=args.sauver)
     if args.sauver:
+        import matplotlib
         matplotlib.use("Agg")
-    from backtest import backtester, tracer
-    from donnees import SCENARIOS, generer_marche
-
-    base = _params(args)
-    lent = ParametresStrategie(court=15, long=60, stop_loss=base.stop_loss,
-                               take_profit=base.take_profit)
-    print("═" * 86)
-    print("  CAS ILLUSTRÉS — 5 jours de barres d'une minute, capital 10 000 $")
-    print("═" * 86)
-    entete = f"{'Marché':<10}{'Buy & hold':>12}{'Scalping':>12}{'Sans frais':>12}" \
-             f"{'Plus lent':>12}{'Trades':>9}{'Drawdown':>11}"
-    print(entete)
-    print("─" * len(entete))
-    for s, description in SCENARIOS.items():
-        df = generer_marche(s, graine=args.graine)
-        r = backtester(df, base, frais=args.frais / 100)
-        r0 = backtester(df, base, frais=0, glissement=0)
-        rl = backtester(df, lent, frais=args.frais / 100)
-        print(f"{s:<10}{r.rendement_buy_and_hold:>+12.1%}{r.rendement_total:>+12.1%}"
-              f"{r0.rendement_total:>+12.1%}{rl.rendement_total:>+12.1%}"
-              f"{len(r.transactions):>9}{r.drawdown_max:>11.1%}")
-        if args.graphique or args.sauver:
-            _montrer(tracer(df, r, base, f"Marché {s} : {description}"), args.sauver, f"cas_{s}")
-    print(f"""
-Colonnes : « Scalping » = MM {base.court}/{base.long} avec frais {args.frais}% et glissement ;
-« Sans frais » = même stratégie sans frais ni glissement ; « Plus lent » = MM 15/60.
-
-Ce qu'il faut retenir :
-  • En marché baissier ou en krach, la stratégie sort vite du marché : elle perd
-    beaucoup moins que « acheter et attendre ».
-  • En marché latéral, les moyennes se croisent sans arrêt : chaque faux signal
-    coûte des frais et du glissement. C'est le pire cas du scalping.
-  • La colonne « Sans frais » montre combien les coûts de transaction pèsent :
-    une stratégie qui trade des dizaines de fois par semaine doit battre ses frais.
-  • Aucun réglage ne gagne partout : testez sur vos propres données (--csv ou --symbole)
-    et sur plusieurs graines (--graine) avant de risquer le moindre dollar.""")
+    noms = list(cas.CAS) if args.tout else (args.nom or ["marches"])
+    for nom in noms:
+        cas.lancer(nom, ctx)
 
 
 def cmd_backtest(args):
@@ -136,6 +127,40 @@ def _journal_resume(msg):
         print(msg)
 
 
+def cmd_comparer(args):
+    """Toutes les stratégies du catalogue, avec leurs réglages par défaut, sur un même marché."""
+    from backtest import backtester
+    from donnees import charger_csv, generer_marche
+    from strategies import creer
+
+    if args.csv:
+        df, titre = charger_csv(args.csv), args.csv
+    else:
+        df, titre = generer_marche(args.scenario, jours=args.jours, graine=args.graine), \
+            f"marché simulé « {args.scenario} », graine {args.graine}"
+    print(f"Comparaison des stratégies — {titre}, capital {args.capital:.0f} $, frais {args.frais}%\n")
+    print(f"{'stratégie':<34}{'rendement':>10}{'trades':>8}{'drawdown':>10}{'Sharpe':>8}{'exposition':>12}")
+    for nom in CATALOGUE:
+        s = creer(nom)
+        r = backtester(df, s, capital=args.capital, frais=args.frais / 100)
+        print(f"{s.description():<34}{r.rendement_total:>+10.1%}{len(r.transactions):>8}"
+              f"{r.drawdown_max:>10.1%}{r.sharpe:>8.1f}{r.exposition:>12.0%}")
+
+
+def cmd_montecarlo(args):
+    import analyses as an
+
+    s = _params(args)
+    mc = an.monte_carlo(args.scenario, s, range(args.graines), jours=args.jours,
+                        frais=args.frais / 100, capital=args.capital)
+    r = an.resume_monte_carlo(mc)
+    print(f"{s.description()} sur « {args.scenario} », {args.graines} marchés simulés de {args.jours} jours")
+    print(f"   rendement moyen {r['moyenne']:+.2%}, médian {r['mediane']:+.2%}")
+    print(f"   90 % des cas entre {r['p5']:+.2%} et {r['p95']:+.2%} (pire {r['pire']:+.2%}, meilleur {r['meilleur']:+.2%})")
+    print(f"   probabilité de gagner {r['proba_gain']:.0%} ; de battre « acheter et attendre » {r['proba_battre_bh']:.0%}")
+    print(f"   drawdown moyen {r['drawdown_moyen']:.1%} ; {r['transactions']:.0f} transactions par marché")
+
+
 def cmd_compte(args):
     from alpaca_connect import CourtierAlpaca
     from config import Config
@@ -173,6 +198,11 @@ def cmd_bot(args):
                  perte_max=args.perte_max / 100)
 
 
+def cas_noms():
+    import cas
+    return cas.CAS
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Scalping par croisement de moyennes mobiles.")
     sous = parser.add_subparsers(dest="commande", required=True)
@@ -182,16 +212,24 @@ def main(argv=None):
         p.add_argument("--long", type=int, default=20, help="MM longue (barres)")
         p.add_argument("--stop", type=float, default=1.0, help="stop-loss en %% (0 = aucun)")
         p.add_argument("--objectif", type=float, default=2.0, help="take-profit en %% (0 = aucun)")
+        p.add_argument("--strategie", default="mm", choices=list(CATALOGUE),
+                       help="stratégie du catalogue (défaut : mm = croisement de moyennes mobiles)")
+        p.add_argument("--fenetre", type=int, help="fenêtre/période de la stratégie (rsi, bollinger, cassure, momentum)")
 
     def marche(p):
         p.add_argument("--scenario", default="haussier",
-                       choices=["haussier", "baissier", "lateral", "volatil", "krach"])
+                       choices=list(SCENARIOS_ETENDUS))
         p.add_argument("--jours", type=int, default=5)
         p.add_argument("--graine", type=int, default=0)
         p.add_argument("--capital", type=float, default=10_000.0)
 
     p = sous.add_parser("cas", help="cas illustrés sur marchés simulés")
     reglages(p)
+    p.add_argument("--nom", action="append", choices=list(cas_noms()),
+                   help="cas à jouer (répétable ; défaut : marches)")
+    p.add_argument("--tout", action="store_true", help="tous les cas")
+    p.add_argument("--liste", action="store_true", help="liste les cas")
+    p.add_argument("--graines", type=int, default=10, help="graines des cas statistiques")
     p.add_argument("--graine", type=int, default=0)
     p.add_argument("--frais", type=float, default=0.05, help="frais par ordre en %%")
     p.add_argument("--graphique", action="store_true")
@@ -216,6 +254,19 @@ def main(argv=None):
     p.add_argument("--perte-max", type=float, default=10.0, help="coupe-circuit en %%")
     p.add_argument("--bavard", action="store_true", help="afficher chaque ordre")
     p.set_defaults(f=cmd_simulation)
+
+    p = sous.add_parser("comparer", help="toutes les stratégies sur un marché")
+    marche(p)
+    p.add_argument("--csv", help="fichier CSV au lieu d'un marché simulé")
+    p.add_argument("--frais", type=float, default=0.05, help="frais par ordre en %%")
+    p.set_defaults(f=cmd_comparer)
+
+    p = sous.add_parser("montecarlo", help="distribution des rendements sur de nombreuses graines")
+    reglages(p)
+    marche(p)
+    p.add_argument("--graines", type=int, default=50, help="nombre de marchés simulés")
+    p.add_argument("--frais", type=float, default=0.05, help="frais par ordre en %%")
+    p.set_defaults(f=cmd_montecarlo)
 
     p = sous.add_parser("compte", help="état du compte Alpaca")
     p.set_defaults(f=cmd_compte)

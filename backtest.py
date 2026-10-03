@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from scalp_strategy import ACHAT, VENTE, ParametresStrategie, decider, moyennes_mobiles
+from scalp_strategy import ACHAT, VENTE, ParametresStrategie, moyennes_mobiles
 
 
 @dataclass
@@ -39,6 +39,7 @@ class Resultat:
     frais_payes: float = 0.0
     buy_and_hold: pd.Series | None = None
     barres_par_an: float = 252 * 390
+    positions: np.ndarray | None = None   # vrai quand une position est détenue à la clôture de la barre
 
     @property
     def rendement_total(self):
@@ -58,6 +59,49 @@ class Resultat:
         if r.std() == 0 or len(r) < 2:
             return 0.0
         return float(r.mean() / r.std() * math.sqrt(self.barres_par_an))
+
+    @property
+    def sortino(self):
+        """Comme Sharpe, mais seules les baisses comptent comme du risque."""
+        r = self.equity.pct_change().dropna()
+        baisse = np.sqrt(np.mean(np.minimum(r.to_numpy(), 0.0) ** 2)) if len(r) else 0.0
+        if baisse == 0:
+            return 0.0
+        return float(r.mean() / baisse * math.sqrt(self.barres_par_an))
+
+    @property
+    def calmar(self):
+        """Rendement total rapporté au pire drawdown (non annualisé : l'horizon est court)."""
+        dd = self.drawdown_max
+        return float(self.rendement_total / -dd) if dd < 0 else 0.0
+
+    @property
+    def exposition(self):
+        """Part du temps passée en position (0 à 1)."""
+        return float(np.mean(self.positions)) if self.positions is not None else float("nan")
+
+    @property
+    def esperance(self):
+        """Gain moyen par transaction ($)."""
+        return float(np.mean([t.gain for t in self.transactions])) if self.transactions else 0.0
+
+    @property
+    def gain_moyen(self):
+        g = [t.gain for t in self.transactions if t.gain > 0]
+        return float(np.mean(g)) if g else 0.0
+
+    @property
+    def perte_moyenne(self):
+        p = [t.gain for t in self.transactions if t.gain < 0]
+        return float(np.mean(p)) if p else 0.0
+
+    @property
+    def duree_moyenne(self):
+        """Durée moyenne d'une transaction, en minutes."""
+        if not self.transactions:
+            return 0.0
+        return float(np.mean([(t.sortie_date - t.entree_date).total_seconds() / 60
+                              for t in self.transactions]))
 
     @property
     def taux_reussite(self):
@@ -85,13 +129,32 @@ class Resultat:
         }
 
 
+    def resume_etendu(self):
+        """``resume()`` plus les mesures de risque et de qualité des transactions."""
+        r = self.resume()
+        r.update({
+            "Sortino (annualisé)": f"{self.sortino:.2f}",
+            "Calmar": f"{self.calmar:.2f}",
+            "Exposition": f"{self.exposition:.0%}",
+            "Espérance par trade": f"{self.esperance:+.2f} $",
+            "Gain moyen / perte moyenne": f"{self.gain_moyen:+.2f} / {self.perte_moyenne:+.2f} $",
+            "Durée moyenne d'un trade": f"{self.duree_moyenne:.0f} min",
+        })
+        return r
+
+
 def backtester(df, params=None, capital=10_000.0, frais=0.0005, glissement=0.0002,
-               barres_par_an=252 * 390):
+               barres_par_an=252 * 390, fraction=1.0):
     """Rejoue la stratégie sur ``df`` (colonnes open/close).
 
+    params : toute stratégie (``decider(prix, en_position, prix_entree)``) ; par défaut
+        le croisement de moyennes mobiles 5/20
     frais : commission proportionnelle par ordre (0,05 % par défaut)
     glissement : écart défavorable entre prix attendu et prix obtenu (0,02 %)
+    fraction : part des liquidités engagée à chaque achat (1 = tout, 0,5 = la moitié)
     """
+    if not 0 < fraction <= 1:
+        raise ValueError("fraction doit être dans ]0, 1].")
     params = params or ParametresStrategie()
     closes = df["close"].to_numpy(dtype=float)
     opens = df["open"].to_numpy(dtype=float)
@@ -99,6 +162,7 @@ def backtester(df, params=None, capital=10_000.0, frais=0.0005, glissement=0.000
     cash, quantite, prix_entree = capital, 0, 0.0
     transactions, frais_payes = [], 0.0
     equity = np.empty(len(df))
+    positions = np.zeros(len(df), dtype=bool)
     en_attente = None  # décision prise à la clôture, exécutée à l'ouverture suivante
 
     for i in range(len(df)):
@@ -107,7 +171,7 @@ def backtester(df, params=None, capital=10_000.0, frais=0.0005, glissement=0.000
             en_attente = None
             if action == ACHAT and quantite == 0:
                 prix = opens[i] * (1 + glissement)
-                q = int(cash // (prix * (1 + frais)))
+                q = int(cash * fraction // (prix * (1 + frais)))
                 if q > 0:
                     cout = q * prix
                     frais_payes += cout * frais
@@ -124,7 +188,8 @@ def backtester(df, params=None, capital=10_000.0, frais=0.0005, glissement=0.000
                 quantite = 0
 
         equity[i] = cash + quantite * closes[i]
-        d = decider(closes[: i + 1], quantite > 0, prix_entree, params)
+        positions[i] = quantite > 0
+        d = params.decider(closes[: i + 1], quantite > 0, prix_entree)
         if d.action:
             en_attente = (d.action, d.raison)
 
@@ -132,7 +197,7 @@ def backtester(df, params=None, capital=10_000.0, frais=0.0005, glissement=0.000
     fermees = [t for t in transactions if t.sortie_prix is not None]
     bh = df["close"] / df["close"].iloc[0] * capital
     return Resultat(capital, pd.Series(equity, index=dates), fermees, frais_payes, bh,
-                    barres_par_an)
+                    barres_par_an, positions)
 
 
 def tracer(df, res, params, titre=""):
