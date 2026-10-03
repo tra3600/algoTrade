@@ -20,6 +20,8 @@ ACHAT, VENTE = "achat", "vente"
 
 @dataclass
 class ParametresStrategie:
+    """Réglages du croisement de moyennes mobiles (et interface commune des stratégies :
+    ``nom``, ``historique``, ``description()``, ``decider(prix, en_position, prix_entree)``)."""
     court: int = 5            # fenêtre de la moyenne mobile courte (en barres)
     long: int = 20            # fenêtre de la moyenne mobile longue
     stop_loss: float = 0.01   # sortie si le prix baisse de 1 % sous le prix d'entrée
@@ -30,6 +32,18 @@ class ParametresStrategie:
             raise ValueError("Il faut 1 ≤ court < long.")
         if self.stop_loss < 0 or self.take_profit < 0:
             raise ValueError("stop_loss et take_profit doivent être positifs (0 = désactivé).")
+
+    nom = "mm"
+
+    @property
+    def historique(self):
+        return self.long + 1
+
+    def description(self):
+        return f"MM {self.court}/{self.long}"
+
+    def decider(self, prix, en_position, prix_entree):
+        return decider(prix, en_position, prix_entree, self)
 
 
 @dataclass

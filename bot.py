@@ -10,7 +10,7 @@ Garde-fous :
 import time
 from datetime import datetime
 
-from scalp_strategy import ACHAT, VENTE, decider
+from scalp_strategy import ACHAT, VENTE
 
 
 def executer_bot(courtier, symbole, params, budget=1_000.0, quantite_fixe=None,
@@ -19,7 +19,7 @@ def executer_bot(courtier, symbole, params, budget=1_000.0, quantite_fixe=None,
     capital_depart = courtier.compte()["capital"]
     mode = "ORDRES ENVOYÉS" if envoyer else "à blanc (aucun ordre envoyé)"
     journal(f"▶ Bot sur {symbole} — {mode} — budget {budget:.0f} $, "
-            f"MM {params.court}/{params.long}, stop {params.stop_loss:.1%}, "
+            f"{params.description()}, stop {params.stop_loss:.1%}, "
             f"objectif {params.take_profit:.1%}, coupe-circuit à -{perte_max:.0%}")
     n = 0
     try:
@@ -40,14 +40,14 @@ def executer_bot(courtier, symbole, params, budget=1_000.0, quantite_fixe=None,
                 break
 
             try:
-                barres = courtier.dernieres_barres(symbole, params.long + 5)
-                if len(barres) < params.long + 1:
+                barres = courtier.dernieres_barres(symbole, params.historique + 5)
+                if len(barres) < params.historique:
                     journal("Pas encore assez de barres, on attend.")
                     dormir(pause)
                     continue
                 closes = barres["close"].to_numpy(dtype=float)
                 pos = courtier.position(symbole)
-                d = decider(closes, pos.quantite > 0, pos.prix_moyen, params)
+                d = params.decider(closes, pos.quantite > 0, pos.prix_moyen)
                 prix = closes[-1]
                 heure = datetime.now().strftime("%H:%M:%S")
                 if d.action == ACHAT:

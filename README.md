@@ -24,6 +24,14 @@ python main.py backtest --scenario krach --transactions --graphique
 python main.py backtest --csv mes_prix.csv       # vos propres données (open,high,low,close,volume)
 python main.py simulation --scenario lateral     # le bot en accéléré, avec coupe-circuit
 
+# Le laboratoire : 14 cas illustrés, 7 stratégies, 10 marchés simulés
+python main.py cas --liste                       # les cas illustrés
+python main.py cas --nom strategies --nom frais  # cas précis (répétable)
+python main.py cas --tout --sauver figures       # tous les cas, figures enregistrées
+python main.py comparer --scenario regimes       # toutes les stratégies sur un marché
+python main.py montecarlo --scenario lateral --graines 100 --strategie rsi
+python main.py backtest --scenario vague --strategie bollinger --transactions
+
 # Avec clés API (compte de démonstration par défaut)
 python main.py compte                            # capital, liquidités, pouvoir d'achat
 python main.py selection                         # action la plus échangée du jour (> 5 $)
@@ -32,7 +40,8 @@ python main.py bot --symbole AAPL                # bot en direct, À BLANC (jour
 python main.py bot --symbole AAPL --envoyer-ordres
 ```
 
-Réglages communs : `--court 5 --long 20` (moyennes mobiles), `--stop 1` (stop-loss en %),
+Réglages communs : `--strategie` (`mm`, `mm_filtre`, `cassure`, `momentum`, `rsi`, `bollinger`, `tenir`),
+`--court 5 --long 20` (moyennes mobiles), `--fenetre` (autres stratégies), `--stop 1` (stop-loss en %),
 `--objectif 2` (take-profit en %). Pour le bot : `--budget`, `--quantite`, `--perte-max`.
 
 ## La stratégie
@@ -73,6 +82,58 @@ Ce qu'on en retient :
 
 ![Latéral](figures/cas_lateral.png)
 
+## Le laboratoire : 14 cas illustrés
+
+Chaque chiffre est calculé par un backtest (frais 0,05 % et glissement 0,02 % par ordre sauf mention
+contraire). `python main.py cas --tout --sauver figures` rejoue tout en environ une minute.
+
+| Cas | Ce qu'il montre |
+|---|---|
+| `marches` | le cas d'origine ci-dessus (MM 5/20 sur 5 marchés) |
+| `nouveaux_marches` | cinq marchés de plus : `regimes`, `rebond`, `vague`, `bulle`, `gaps` |
+| `strategies` | 6 stratégies × 10 marchés : trois stratégies différentes gagnent quelque part, **aucune partout** |
+| `echelle` | la même oscillation est un retour à la moyenne (RSI/Bollinger gagnent) pour des périodes de 10 à 30 min et une tendance (MM/cassure gagnent) de 45 à 150 min |
+| `frais` | seuil de rentabilité par dichotomie : 0,15 % par ordre pour un momentum, 0,01 % pour la MM 5/20 |
+| `reglages` | grilles court × long : le meilleur couple change avec le marché (5/60, 12/30, 2/10) |
+| `surapprentissage` | optimiser sur la 1re moitié, juger sur la 2e : le réglage « optimal » déçoit dans 9 cas sur 10 |
+| `monte_carlo` | 50 graines : la MM a 0 % de chances de gagner en latéral ; le momentum gagne dans 100 % des marchés à régimes |
+| `risque` | stop-loss, take-profit et leur garantie : le stop à −1 % coûte en moyenne −1,14 %, jusqu'à −2,3 % |
+| `taille` | la taille de position règle l'échelle du risque, pas la qualité ; fraction de Kelly |
+| `regimes` | le filtre de tendance (ratio d'efficacité de Kaufman) évite les faux signaux hors tendance |
+| `metriques` | Sharpe, Sortino, Calmar, drawdown, espérance, exposition, recalculés à la main |
+| `bot` | le coupe-circuit sur un krach, mode à blanc, toutes les stratégies dans le bot |
+| `anatomie` | la raison écrite de chaque décision, tracée sur le prix |
+
+### Qui gagne où ?
+
+![Rendement moyen de chaque stratégie dans chaque marché](figures/strategies_matrice.png)
+
+### Pourquoi RSI et Bollinger achètent là
+
+![Bollinger sur un marché qui oscille](figures/anatomie_bollinger.png)
+
+## Les stratégies (`strategies.py`)
+
+Toutes ont la même interface que le croisement de moyennes mobiles : une fonction pure du passé des
+prix, utilisée à l'identique par le backtest et le bot.
+
+| Nom | Famille | Idée |
+|---|---|---|
+| `mm` | tendance | croisement de moyennes mobiles 5/20 (la stratégie d'origine) |
+| `mm_filtre` | tendance | idem, mais seulement si le ratio d'efficacité de Kaufman montre une direction |
+| `cassure` | tendance | achat au-dessus du plus haut des 20 dernières barres (canal de Donchian) |
+| `momentum` | tendance | on suit ce qui a monté de plus de 0,3 % sur 30 barres |
+| `rsi` | retour à la moyenne | achat des survendus (RSI < 30), vente au retour à 55 |
+| `bollinger` | retour à la moyenne | achat sous la bande basse, vente au retour sur la moyenne |
+| `tenir` | référence | acheter et attendre, avec les mêmes frais |
+
+## Les marchés simulés (`donnees.py`)
+
+Cinq marchés d'origine (`haussier`, `baissier`, `lateral`, `volatil`, `krach`, inchangés à la décimale
+près) et cinq nouveaux : `regimes` (alternance de tendances et d'absence de direction, étiquettes dans
+`df.attrs["regimes"]`), `rebond` (chute puis remontée en V), `vague` (oscillation de période réglable),
+`bulle` (accélération puis éclatement), `gaps` (écart à l'ouverture chaque matin).
+
 ## Garde-fous du bot
 
 | Garde-fou | Comportement |
@@ -89,14 +150,17 @@ Ce qu'on en retient :
 | Fichier | Rôle |
 |---|---|
 | `main.py` | ligne de commande (`cas`, `backtest`, `simulation`, `compte`, `selection`, `bot`) |
-| `scalp_strategy.py` | la stratégie, une fonction pure utilisée à l'identique en backtest et en direct |
-| `backtest.py` | rejeu avec frais et glissement, sans lecture de l'avenir ; métriques et graphiques |
-| `donnees.py` | marchés simulés (5 scénarios), CSV, historique Alpaca |
+| `scalp_strategy.py` | la stratégie d'origine, une fonction pure utilisée à l'identique en backtest et en direct |
+| `strategies.py` | le catalogue : MM filtrée, cassure, momentum, RSI, Bollinger, acheter-et-garder |
+| `backtest.py` | rejeu avec frais, glissement et fraction engagée, sans lecture de l'avenir ; métriques (Sharpe, Sortino, Calmar, exposition, espérance...) et graphiques |
+| `analyses.py` | Monte-Carlo, seuil de rentabilité en frais, grilles de réglages, surapprentissage, Kelly, régimes |
+| `cas.py`, `illustrations.py` | les 14 cas illustrés et leurs figures |
+| `donnees.py` | marchés simulés (10 scénarios), CSV, historique Alpaca |
 | `alpaca_connect.py` | courtier Alpaca (SDK `alpaca-py`) et courtier simulé, avec la même interface |
 | `trade_volume.py` | choix de l'action la plus active (screener Alpaca), hors penny stocks |
 | `bot.py` | boucle de trading et garde-fous |
 | `config.py` | clés lues dans l'environnement ou `.env`, jamais dans le code |
-| `test_algotrade.py` | 21 tests hors ligne (`python -m pytest -q`) |
+| `test_algotrade.py`, `test_laboratoire.py` | 94 tests hors ligne (`python -m pytest -q`, environ 35 s) |
 
 ## Ce qui a changé par rapport à la première version
 
